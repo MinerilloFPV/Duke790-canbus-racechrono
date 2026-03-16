@@ -7,8 +7,8 @@ channels to the [RaceChrono](https://racechrono.app/) app over Bluetooth BLE.
 
 | File | Description |
 |------|-------------|
-| `esp32.ino` | Arduino sketch — upload to ESP32 |
-| `can_decoder.h` | CAN frame decoder (shared by sketch and tests) |
+| `esp32/esp32.ino` | Arduino sketch — upload to ESP32 |
+| `can_decoder.h` | CAN frame decoder used by unit tests only |
 | `test_decoder.cpp` | Unit tests — compile and run on any PC, no hardware needed |
 
 ---
@@ -75,16 +75,18 @@ Download from https://www.arduino.cc/en/software (version 2.x recommended).
    ```
 4. **Tools → Board → Boards Manager** → search `esp32` → install **esp32 by Espressif Systems**
 
-### Step 3 — Install RaceChrono library
+### Step 3 — Install required libraries
 
-**Tools → Manage Libraries** → search `RaceChrono` → install **arduino-RaceChrono by timurrrr**
+In Arduino IDE open **Tools → Manage Libraries** and install both:
+
+| Library | Author | Why |
+|---------|--------|-----|
+| **arduino-RaceChrono** | timurrrr | RaceChrono BLE protocol |
+| **NimBLE-Arduino** | h2zero | BLE stack required by arduino-RaceChrono on ESP32 |
 
 ### Step 4 — Open the sketch
 
-**File → Open** → navigate to this folder and select `esp32.ino`.
-
-Arduino IDE will automatically include `can_decoder.h` because it is in the
-**same folder** as `esp32.ino`. Do not move them apart.
+**File → Open** → navigate to the `esp32/` sub-folder and select `esp32.ino`.
 
 ### Step 5 — Select board and port
 
@@ -110,7 +112,14 @@ Bluetooth BLE: waiting for RaceChrono...
 1. Open RaceChrono on your phone
 2. **Settings → Connections → Add BLE DIY device**
 3. Select **KTM 790 DIY Track**
-4. Channels will appear automatically
+
+### Step 8 — Configure CAN-Bus channels in the app
+
+The ESP32 forwards raw CAN frames to RaceChrono — the app decodes them.
+Channels must be defined **once** inside the app:
+
+1. In RaceChrono go to **Settings → Connections → KTM 790 DIY Track → CAN-Bus channels**
+2. Tap **+** and add each channel from the table in the [RaceChrono channels](#racechrono-channels) section below
 
 ---
 
@@ -149,19 +158,25 @@ To change pins edit `esp32.ino`:
 
 ## RaceChrono channels
 
-| Channel | Unit | Source |
-|---------|------|--------|
-| RPM | rpm | 0x120 D0–D1 |
-| Throttle Position | % | 0x120 D2 |
-| Gear | — | 0x129 D0 high nibble |
-| Wheel Speed Front | km/h | 0x12B D0–D1 / 10 |
-| Wheel Speed Rear | km/h | 0x12B D2–D3 / 10 |
-| Lean Angle | deg | 0x12B 12-bit signed (D6 low + D7) |
-| Pitch (Wheelie) | deg | 0x12B 12-bit signed (D5 + D6 high) |
-| Brake Pressure Front | bar | 0x290 D0–D1 / 10 |
-| Brake Pressure Rear | bar | 0x290 D2–D3 / 10 |
-| MTC Intervention | — | 0x450 D2 bit 0 |
-| Engine Temp | °C | 0x540 D6–D7 / 10 |
+Configure these channels under **Settings → Connections → KTM 790 DIY Track → CAN-Bus channels** in the RaceChrono app.
+
+> All multi-byte values are **big-endian**.
+
+| Channel name | Unit | CAN ID | Offset (bytes) | Length (bytes) | Type | Multiplier | Notes |
+|---|---|---|---|---|---|---|---|
+| RPM | rpm | `0x120` | 0 | 2 | unsigned | 1 | 0–15 000 rpm |
+| Throttle Position | % | `0x120` | 2 | 1 | unsigned | 100/255 ≈ 0.3922 | 0–100 % |
+| Gear | | `0x129` | 0 | 1 | unsigned | 1 | high nibble only — set bit mask `0xF0`, shift right 4 |
+| Wheel Speed Front | km/h | `0x12B` | 0 | 2 | unsigned | 1/16 = 0.0625 | |
+| Wheel Speed Rear | km/h | `0x12B` | 2 | 2 | unsigned | 1/16 = 0.0625 | |
+| Pitch (Wheelie) | deg | `0x12B` | 5 | 2 | signed 12-bit | 1 | bits [11:0] = D5[7:0]\|D6[7:4] |
+| Lean Angle | deg | `0x12B` | 6 | 2 | signed 12-bit | 1 | bits [11:0] = D6[3:0]\|D7[7:0] |
+| Brake Pressure Front | bar | `0x290` | 0 | 2 | unsigned | 0.1 | |
+| Brake Pressure Rear | bar | `0x290` | 2 | 2 | unsigned | 0.1 | |
+| MTC Intervention | | `0x450` | 2 | 1 | unsigned | 1 | bit 0 only (1 = active) |
+| Engine Temp | °C | `0x540` | 6 | 2 | unsigned | 0.1 | |
+
+> **Gear note:** RaceChrono does not support bit-shift natively. Use multiplier `1` and set the *bit mask* field to `0xF0` with *right shift* `4` if your app version supports it; otherwise leave gear as raw byte (values 0–6 become 0, 16, 32 … — still usable as a relative indicator).
 
 ## References
 
