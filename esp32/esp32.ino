@@ -10,17 +10,17 @@ static constexpr uint32_t HEARTBEAT_MS = 1000;
 static constexpr uint32_t NO_CAN_WARN_MS = 3000;
 
 // --- Bitrate scan configuration ---
-// Set to true to auto-detect CAN bitrate on startup.
-// Once detected, change DETECTED_BITRATE below and set SCAN_MODE = false.
 static constexpr bool SCAN_MODE = true;
-static constexpr uint32_t SCAN_PROBE_MS = 2000; // time per bitrate attempt
+static constexpr uint32_t SCAN_PROBE_MS = 3000;  // time per bitrate attempt
+static constexpr uint32_t BUS_WAIT_TIMEOUT_MS = 30000; // max wait for bus activity
+static constexpr uint32_t RESCAN_BUS_ERR_THRESHOLD = 5000; // bus_err count to trigger rescan
 
 struct BitrateEntry {
     const char* label;
     twai_timing_config_t timing;
 };
 
-// Common CAN bitrates to try (most likely first)
+// Common CAN bitrates to try (most likely first for KTM)
 static BitrateEntry BITRATES[] = {
     { "500 kbps", TWAI_TIMING_CONFIG_500KBITS()  },
     { "250 kbps", TWAI_TIMING_CONFIG_250KBITS()  },
@@ -34,6 +34,9 @@ static BitrateEntry BITRATES[] = {
 static constexpr size_t NUM_BITRATES = sizeof(BITRATES) / sizeof(BITRATES[0]);
 
 static const char* g_activeBitrateLabel = "unknown";
+static bool g_scanLocked = false; // true once a valid bitrate is found
+static uint32_t g_lastBusErrSnapshot = 0;
+static uint32_t g_busErrCheckMs = 0;
 
 // ---------------------------------------------------------------------------
 // RaceChrono BLE handler.
@@ -123,18 +126,71 @@ static void logHeartbeat() {
     if (g_lastCanFrameMs == 0 || (now - g_lastCanFrameMs) >= NO_CAN_WARN_MS) {
         if (now - g_lastNoCanWarnMs >= NO_CAN_WARN_MS) {
             g_lastNoCanWarnMs = now;
-            Serial.println("[CAN] WARNING: no CAN frames seen recently. Check CAN_H/CAN_L wiring, ground, bitrate, and whether the bike is awake/ignition ON.");
+            Serial.println("[CAN] WARNING: no CAN frames seen recently.");
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Bitrate scanner: tries each bitrate for SCAN_PROBE_MS and checks if any
-// valid CAN frames are received (bus_err should stop growing).
+// Wait for bus activity: start at 500 kbps and wait until bus_err > 0 or
+// a frame is received. This ensures the scan only runs when there is
+// actual CAN traffic (bike ignition ON).
+// ---------------------------------------------------------------------------
+static void waitForBusActivity() {
+    Serial.println("\n[SCAN] Waiting for CAN bus activity (turn ignition ON)...");
+
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    twai_driver_install(&g_config, &t_config, &f_config);
+    twai_start();
+
+    uint32_t startMs = millis();
+    uint32_t dotMs = millis();
+
+    while (millis() - startMs < BUS_WAIT_TIMEOUT_MS) {
+        // Check for a received frame (would mean 500 kbps is correct)
+        twai_message_t msg;
+        if (twai_receive(&msg, pdMS_TO_TICKS(200)) == ESP_OK) {
+            Serial.println("\n[SCAN] Got a frame at 500 kbps during wait — bus is active!");
+            // 500 kbps works right away
+            twai_stop();
+            twai_driver_uninstall();
+            return;
+        }
+
+        // Check bus errors — if they grow, bus is active (wrong bitrate = errors)
+        twai_status_info_t status{};
+        twai_get_status_info(&status);
+        if (status.bus_error_count > 100) {
+            Serial.printf("\n[SCAN] Bus activity detected! (bus_err=%lu) — starting scan.\n",
+                (unsigned long)status.bus_error_count);
+            twai_stop();
+            twai_driver_uninstall();
+            return;
+        }
+
+        if (millis() - dotMs >= 1000) {
+            dotMs = millis();
+            Serial.printf("[SCAN] Waiting... (%lus, bus_err=%lu)\n",
+                (unsigned long)((millis() - startMs) / 1000),
+                (unsigned long)status.bus_error_count);
+        }
+    }
+
+    Serial.println("\n[SCAN] Timeout waiting for bus activity. Proceeding with scan anyway...");
+    twai_stop();
+    twai_driver_uninstall();
+}
+
+// ---------------------------------------------------------------------------
+// Bitrate scanner
 // ---------------------------------------------------------------------------
 static bool tryBitrate(size_t idx) {
     BitrateEntry& entry = BITRATES[idx];
-    Serial.printf("\n[SCAN] === Trying %s ===\n", entry.label);
+    Serial.printf("\n[SCAN] === Trying %s (%lu ms) ===\n", entry.label, (unsigned long)SCAN_PROBE_MS);
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
@@ -157,15 +213,16 @@ static bool tryBitrate(size_t idx) {
         twai_message_t msg;
         if (twai_receive(&msg, pdMS_TO_TICKS(50)) == ESP_OK) {
             ++frames;
-            Serial.printf("[SCAN] %s: GOT FRAME! id=0x%03lX dlc=%u\n",
-                entry.label, (unsigned long)msg.identifier, msg.data_length_code);
+            logCanFrame(msg);
+            Serial.printf("[SCAN] %s: ^^^ GOT FRAME #%lu!\n",
+                entry.label, (unsigned long)frames);
         }
     }
 
     // Check bus errors
     twai_status_info_t status{};
     twai_get_status_info(&status);
-    Serial.printf("[SCAN] %s: frames=%lu bus_err=%lu rx_err=%lu state=%s\n",
+    Serial.printf("[SCAN] %s result: frames=%lu bus_err=%lu rx_err=%lu state=%s\n",
         entry.label,
         (unsigned long)frames,
         (unsigned long)status.bus_error_count,
@@ -175,12 +232,19 @@ static bool tryBitrate(size_t idx) {
     if (frames > 0) {
         Serial.printf("\n[SCAN] *** SUCCESS: %s works! Received %lu frames ***\n\n",
             entry.label, (unsigned long)frames);
-        // Leave driver running at this bitrate
         g_activeBitrateLabel = entry.label;
+        g_scanLocked = true;
         return true;
     }
 
-    // No frames — stop and uninstall, try next
+    // No frames — also report if bus was active (errors = signal present but wrong rate)
+    if (status.bus_error_count > 0) {
+        Serial.printf("[SCAN] %s: bus active but WRONG bitrate (bus_err=%lu)\n",
+            entry.label, (unsigned long)status.bus_error_count);
+    } else {
+        Serial.printf("[SCAN] %s: bus SILENT (no errors, no frames)\n", entry.label);
+    }
+
     twai_stop();
     twai_driver_uninstall();
     return false;
@@ -189,7 +253,6 @@ static bool tryBitrate(size_t idx) {
 static bool scanBitrates() {
     Serial.println("\n[SCAN] ========================================");
     Serial.println("[SCAN] Starting CAN bitrate auto-detection...");
-    Serial.println("[SCAN] Make sure the bike ignition is ON!");
     Serial.printf("[SCAN] Will try %u bitrates, %lu ms each\n",
         (unsigned)NUM_BITRATES, (unsigned long)SCAN_PROBE_MS);
     Serial.println("[SCAN] ========================================\n");
@@ -202,12 +265,11 @@ static bool scanBitrates() {
 
     Serial.println("\n[SCAN] ========================================");
     Serial.println("[SCAN] FAILED: No valid bitrate found!");
-    Serial.println("[SCAN] Possible causes:");
-    Serial.println("[SCAN]   1. Bike ignition is OFF (no CAN traffic)");
-    Serial.println("[SCAN]   2. CAN_H / CAN_L swapped on transceiver");
-    Serial.println("[SCAN]   3. SN65HVD230 Rs pin not connected to GND");
-    Serial.println("[SCAN]   4. TX/RX pins swapped (try swapping GPIO 4 <-> 5)");
-    Serial.println("[SCAN]   5. Missing GND connection between ESP32 and bike");
+    Serial.println("[SCAN] Possible hardware issues:");
+    Serial.println("[SCAN]   1. CAN_H / CAN_L swapped on transceiver");
+    Serial.println("[SCAN]   2. TX/RX pins swapped (GPIO 4 <-> 5)");
+    Serial.println("[SCAN]   3. Missing GND between ESP32 and bike");
+    Serial.println("[SCAN]   4. SN65HVD230 defective or wrong wiring");
     Serial.println("[SCAN] ========================================\n");
 
     // Fall back to 500 kbps
@@ -220,6 +282,38 @@ static bool scanBitrates() {
     twai_driver_install(&g_config, &t_config, &f_config);
     twai_start();
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-rescan: called from loop() when bus_err grows but no frames received.
+// This handles the case where ignition is turned ON after initial scan.
+// ---------------------------------------------------------------------------
+static void checkAndRescan() {
+    if (g_scanLocked || !SCAN_MODE) return;
+    if (g_totalFrames > 0) {
+        g_scanLocked = true; // frames are coming, no need to rescan
+        return;
+    }
+
+    uint32_t now = millis();
+    if (now - g_busErrCheckMs < 3000) return; // check every 3s
+    g_busErrCheckMs = now;
+
+    twai_status_info_t status{};
+    if (twai_get_status_info(&status) != ESP_OK) return;
+
+    uint32_t errDelta = status.bus_error_count - g_lastBusErrSnapshot;
+    g_lastBusErrSnapshot = status.bus_error_count;
+
+    if (errDelta > RESCAN_BUS_ERR_THRESHOLD) {
+        Serial.printf("\n[SCAN] Bus errors growing rapidly (%lu new errors) but 0 frames — re-scanning!\n",
+            (unsigned long)errDelta);
+        // Stop current driver
+        twai_stop();
+        twai_driver_uninstall();
+        // Run full scan
+        scanBitrates();
+    }
 }
 
 static void waitForConnection() {
@@ -235,9 +329,11 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println();
-    Serial.println("[APP] Booting KTM 790 DIY Track bridge...");
-    Serial.printf("[APP] CAN pins: TX=%d RX=%d\n", CAN_TX_PIN, CAN_RX_PIN);
-    Serial.println("[APP] Transceiver: SN65HVD230 (Rs pin MUST be tied to GND!)");
+    Serial.println("[APP] =============================================");
+    Serial.println("[APP] Booting KTM 790 DIY Track CAN-BLE bridge");
+    Serial.printf("[APP] CAN pins: TX=GPIO%d  RX=GPIO%d\n", CAN_TX_PIN, CAN_RX_PIN);
+    Serial.println("[APP] Transceiver: SN65HVD230");
+    Serial.println("[APP] =============================================");
 
     // Init BLE
     RaceChronoBle.setUp("KTM 790 DIY Track", &handler);
@@ -246,10 +342,17 @@ void setup() {
 
     // Init TWAI (CAN)
     if (SCAN_MODE) {
+        waitForBusActivity();
         scanBitrates();
+        g_busErrCheckMs = millis();
+        // snapshot current bus_err for rescan detection
+        twai_status_info_t st{};
+        if (twai_get_status_info(&st) == ESP_OK) {
+            g_lastBusErrSnapshot = st.bus_error_count;
+        }
     } else {
-        // Direct mode — use 500 kbps (change after scan finds correct rate)
         g_activeBitrateLabel = "500 kbps";
+        g_scanLocked = true;
         twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
             (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
         twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
@@ -296,6 +399,9 @@ void loop() {
                                       msg.data_length_code);
         }
     }
+
+    // Auto-rescan if bus errors growing but no frames received
+    checkAndRescan();
 
     logHeartbeat();
 }
