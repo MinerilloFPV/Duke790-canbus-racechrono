@@ -2,8 +2,8 @@
 #include "driver/twai.h"
 
 // --- CAN (TWAI) pins ---
-#define CAN_TX_PIN 5
-#define CAN_RX_PIN 4
+#define CAN_TX_PIN_DEFAULT 5
+#define CAN_RX_PIN_DEFAULT 4
 
 // --- Debug / logging ---
 static constexpr uint32_t HEARTBEAT_MS = 1000;
@@ -14,6 +14,8 @@ static constexpr bool SCAN_MODE = true;
 static constexpr uint32_t SCAN_PROBE_MS = 3000;  // time per bitrate attempt
 static constexpr uint32_t BUS_WAIT_TIMEOUT_MS = 30000; // max wait for bus activity
 static constexpr uint32_t RESCAN_BUS_ERR_THRESHOLD = 5000; // bus_err count to trigger rescan
+static constexpr uint32_t RESCAN_COOLDOWN_MS = 30000; // minimum time between rescans
+static constexpr uint32_t MAX_RESCANS = 3; // stop re-scanning after this many failures
 
 struct BitrateEntry {
     const char* label;
@@ -37,6 +39,13 @@ static const char* g_activeBitrateLabel = "unknown";
 static bool g_scanLocked = false; // true once a valid bitrate is found
 static uint32_t g_lastBusErrSnapshot = 0;
 static uint32_t g_busErrCheckMs = 0;
+
+// --- Pin swap auto-test ---
+static uint8_t g_canTxPin = CAN_TX_PIN_DEFAULT;
+static uint8_t g_canRxPin = CAN_RX_PIN_DEFAULT;
+static bool g_pinsSwapped = false;
+static uint32_t g_rescanCount = 0;
+static uint32_t g_lastRescanMs = 0;
 
 // ---------------------------------------------------------------------------
 // RaceChrono BLE handler.
@@ -138,9 +147,11 @@ static void logHeartbeat() {
 // ---------------------------------------------------------------------------
 static void waitForBusActivity() {
     Serial.println("\n[SCAN] Waiting for CAN bus activity (turn ignition ON)...");
+    Serial.printf("[SCAN] Using pins: TX=GPIO%d  RX=GPIO%d %s\n",
+        g_canTxPin, g_canRxPin, g_pinsSwapped ? "(SWAPPED)" : "(default)");
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+        (gpio_num_t)g_canTxPin, (gpio_num_t)g_canRxPin, TWAI_MODE_LISTEN_ONLY);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -193,7 +204,7 @@ static bool tryBitrate(size_t idx) {
     Serial.printf("\n[SCAN] === Trying %s (%lu ms) ===\n", entry.label, (unsigned long)SCAN_PROBE_MS);
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+        (gpio_num_t)g_canTxPin, (gpio_num_t)g_canRxPin, TWAI_MODE_LISTEN_ONLY);
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &entry.timing, &f_config) != ESP_OK) {
@@ -270,13 +281,35 @@ static bool scanBitrates() {
     Serial.println("[SCAN]   2. TX/RX pins swapped (GPIO 4 <-> 5)");
     Serial.println("[SCAN]   3. Missing GND between ESP32 and bike");
     Serial.println("[SCAN]   4. SN65HVD230 defective or wrong wiring");
+    Serial.printf("[SCAN] Pins used: TX=GPIO%d  RX=GPIO%d %s\n",
+        g_canTxPin, g_canRxPin, g_pinsSwapped ? "(SWAPPED)" : "(default)");
     Serial.println("[SCAN] ========================================\n");
 
-    // Fall back to 500 kbps
-    Serial.println("[SCAN] Falling back to 500 kbps...");
+    // --- Auto pin-swap: if first attempt failed with default pins, try swapped ---
+    if (!g_pinsSwapped) {
+        g_pinsSwapped = true;
+        g_canTxPin = CAN_RX_PIN_DEFAULT;  // was 4, now used as TX
+        g_canRxPin = CAN_TX_PIN_DEFAULT;  // was 5, now used as RX
+        Serial.println("[SCAN] >>> AUTO-TEST: Trying with SWAPPED pins <<<");
+        Serial.printf("[SCAN] >>> TX=GPIO%d  RX=GPIO%d <<<\n", g_canTxPin, g_canRxPin);
+
+        // Run scan again with swapped pins
+        return scanBitrates();
+    }
+
+    // Both pin configs failed — revert to default and fall back
+    g_pinsSwapped = false;
+    g_canTxPin = CAN_TX_PIN_DEFAULT;
+    g_canRxPin = CAN_RX_PIN_DEFAULT;
+
+    Serial.println("[SCAN] Both pin configurations failed!");
+    Serial.println("[SCAN] Most likely cause: CAN_H and CAN_L wires are SWAPPED.");
+    Serial.println("[SCAN] >>> Try swapping the two CAN bus wires on the transceiver <<<");
+    Serial.println("[SCAN] Falling back to 500 kbps (default pins)...");
+
     g_activeBitrateLabel = "500 kbps (fallback)";
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+        (gpio_num_t)g_canTxPin, (gpio_num_t)g_canRxPin, TWAI_MODE_LISTEN_ONLY);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     twai_driver_install(&g_config, &t_config, &f_config);
@@ -287,6 +320,7 @@ static bool scanBitrates() {
 // ---------------------------------------------------------------------------
 // Auto-rescan: called from loop() when bus_err grows but no frames received.
 // This handles the case where ignition is turned ON after initial scan.
+// Fixed: proper delta calc, cooldown timer, max rescan limit.
 // ---------------------------------------------------------------------------
 static void checkAndRescan() {
     if (g_scanLocked || !SCAN_MODE) return;
@@ -294,25 +328,64 @@ static void checkAndRescan() {
         g_scanLocked = true; // frames are coming, no need to rescan
         return;
     }
+    if (g_rescanCount >= MAX_RESCANS) return; // stop after too many failed rescans
 
     uint32_t now = millis();
     if (now - g_busErrCheckMs < 3000) return; // check every 3s
     g_busErrCheckMs = now;
 
+    // Enforce cooldown between rescans
+    if (g_lastRescanMs > 0 && (now - g_lastRescanMs < RESCAN_COOLDOWN_MS)) return;
+
     twai_status_info_t status{};
     if (twai_get_status_info(&status) != ESP_OK) return;
 
-    uint32_t errDelta = status.bus_error_count - g_lastBusErrSnapshot;
-    g_lastBusErrSnapshot = status.bus_error_count;
+    uint32_t currentErr = status.bus_error_count;
+    // Use safe delta: if current < snapshot (driver was reinstalled), just use current value
+    uint32_t errDelta = (currentErr >= g_lastBusErrSnapshot)
+        ? (currentErr - g_lastBusErrSnapshot)
+        : currentErr;
+    g_lastBusErrSnapshot = currentErr;
 
     if (errDelta > RESCAN_BUS_ERR_THRESHOLD) {
-        Serial.printf("\n[SCAN] Bus errors growing rapidly (%lu new errors) but 0 frames — re-scanning!\n",
-            (unsigned long)errDelta);
+        g_rescanCount++;
+        g_lastRescanMs = now;
+        Serial.printf("\n[SCAN] Bus errors growing (%lu new in 3s) but 0 frames — re-scan #%lu/%lu\n",
+            (unsigned long)errDelta, (unsigned long)g_rescanCount, (unsigned long)MAX_RESCANS);
         // Stop current driver
         twai_stop();
         twai_driver_uninstall();
-        // Run full scan
+        // Reset pin swap state for fresh attempt
+        g_pinsSwapped = false;
+        g_canTxPin = CAN_TX_PIN_DEFAULT;
+        g_canRxPin = CAN_RX_PIN_DEFAULT;
+        // Run full scan (will auto-try swapped pins too)
         scanBitrates();
+        // Update snapshot for new driver instance
+        twai_status_info_t st{};
+        if (twai_get_status_info(&st) == ESP_OK) {
+            g_lastBusErrSnapshot = st.bus_error_count;
+        } else {
+            g_lastBusErrSnapshot = 0;
+        }
+        g_busErrCheckMs = millis();
+
+        if (g_rescanCount >= MAX_RESCANS && !g_scanLocked) {
+            Serial.println("\n[SCAN] ====================================================");
+            Serial.println("[SCAN] Max rescans reached. Stopping auto-scan.");
+            Serial.println("[SCAN] HARDWARE DIAGNOSIS:");
+            Serial.println("[SCAN]   Your ESP32 sees electrical activity (bus_err grows)");
+            Serial.println("[SCAN]   but cannot decode frames at ANY bitrate with");
+            Serial.println("[SCAN]   EITHER pin configuration.");
+            Serial.println("[SCAN]");
+            Serial.println("[SCAN]   This almost certainly means:");
+            Serial.println("[SCAN]   >>> CAN_H and CAN_L wires are SWAPPED <<<");
+            Serial.println("[SCAN]   on the SN65HVD230 transceiver board.");
+            Serial.println("[SCAN]");
+            Serial.println("[SCAN]   Swap the two wires going from the transceiver");
+            Serial.println("[SCAN]   to the motorcycle's CAN bus connector.");
+            Serial.println("[SCAN] ====================================================\n");
+        }
     }
 }
 
@@ -331,7 +404,8 @@ void setup() {
     Serial.println();
     Serial.println("[APP] =============================================");
     Serial.println("[APP] Booting KTM 790 DIY Track CAN-BLE bridge");
-    Serial.printf("[APP] CAN pins: TX=GPIO%d  RX=GPIO%d\n", CAN_TX_PIN, CAN_RX_PIN);
+    Serial.printf("[APP] CAN pins: TX=GPIO%d  RX=GPIO%d\n", g_canTxPin, g_canRxPin);
+    Serial.println("[APP] Pin swap auto-test: ENABLED");
     Serial.println("[APP] Transceiver: SN65HVD230");
     Serial.println("[APP] =============================================");
 
@@ -354,7 +428,7 @@ void setup() {
         g_activeBitrateLabel = "500 kbps";
         g_scanLocked = true;
         twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-            (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+            (gpio_num_t)g_canTxPin, (gpio_num_t)g_canRxPin, TWAI_MODE_LISTEN_ONLY);
         twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
         twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
